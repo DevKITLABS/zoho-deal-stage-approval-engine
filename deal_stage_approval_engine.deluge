@@ -1,0 +1,259 @@
+dealId = input.dealId.toLong();
+dealData = zoho.crm.getRecordById("Deals", dealId);
+
+if(dealData.isEmpty())
+{
+	info "Deal not found";
+	return;
+}
+
+dealName = ifnull(dealData.get("Deal_Name"),"");
+stage = ifnull(dealData.get("Stage"),"");
+amount = ifnull(dealData.get("Amount"),0.0);
+discount = ifnull(dealData.get("Discount_Percentage"),0.0);
+industry = ifnull(dealData.get("Industry"),"");
+accountLookup = dealData.get("Account_Name");
+owner = dealData.get("Owner");
+closingDate = dealData.get("Closing_Date");
+lastActivity = dealData.get("Last_Activity_Time");
+probability = ifnull(dealData.get("Probability"),0);
+paymentTerms = ifnull(dealData.get("Payment_Terms"),"");
+region = ifnull(dealData.get("Region"),"");
+proposalAttached = ifnull(dealData.get("Proposal_Attached"),false);
+contractSigned = ifnull(dealData.get("Signed_Contract"),false);
+
+accountId = "";
+if(accountLookup != null)
+{
+	accountId = accountLookup.get("id");
+}
+
+riskScore = 0;
+approvalRequired = false;
+approvalReason = List();
+validationErrors = List();
+
+// DISCOUNT VALIDATION
+
+if(discount > 10)
+{
+	riskScore = riskScore + 15;
+}
+
+if(discount > 20)
+{
+	approvalRequired = true;
+	approvalReason.add("Discount exceeds 20%");
+}
+
+if(discount > 35)
+{
+	validationErrors.add("Discount above allowed limit");
+}
+
+// DEAL AMOUNT VALIDATION
+
+if(amount >= 50000)
+{
+	riskScore = riskScore + 20;
+}
+
+if(amount >= 100000)
+{
+	approvalRequired = true;
+	approvalReason.add("High value deal");
+}
+
+// STAGE VALIDATIONS
+
+if(stage == "Negotiation")
+{
+	if(proposalAttached == false)
+	{
+		validationErrors.add("Proposal document required before Negotiation");
+	}
+}
+
+if(stage == "Closed Won")
+{
+	if(contractSigned == false)
+	{
+		validationErrors.add("Signed contract required");
+	}
+
+	if(paymentTerms == "90 Days")
+	{
+		approvalRequired = true;
+		approvalReason.add("Risky payment terms");
+	}
+}
+
+// DUPLICATE DEAL DETECTION
+
+duplicateDeals = zoho.crm.searchRecords("Deals","(Account_Name:equals:" + accountId + ")");
+
+duplicateCount = 0;
+
+for each duplicate in duplicateDeals
+{
+	dupId = duplicate.get("id");
+
+	if(dupId != dealId)
+	{
+		dupStage = ifnull(duplicate.get("Stage"),"");
+
+		if(dupStage != "Closed Lost")
+		{
+			duplicateCount = duplicateCount + 1;
+		}
+	}
+}
+
+if(duplicateCount > 2)
+{
+	riskScore = riskScore + 25;
+	approvalRequired = true;
+	approvalReason.add("Multiple open deals found");
+}
+
+// INDUSTRY RISK
+
+highRiskIndustries = List();
+highRiskIndustries.add("Construction");
+highRiskIndustries.add("Mining");
+highRiskIndustries.add("Oil & Gas");
+
+if(highRiskIndustries.contains(industry))
+{
+	riskScore = riskScore + 20;
+}
+
+// REGION BASED RULES
+
+if(region == "EMEA")
+{
+	if(amount > 75000)
+	{
+		approvalRequired = true;
+		approvalReason.add("EMEA finance approval required");
+	}
+}
+
+if(region == "APAC")
+{
+	riskScore = riskScore + 5;
+}
+
+// DEAL INACTIVITY CHECK
+
+if(lastActivity != null)
+{
+	diffDays = zoho.currentdate.toLong() - lastActivity.toDate().toLong();
+
+	if(diffDays > 14)
+	{
+		riskScore = riskScore + 10;
+
+		taskMap = Map();
+		taskMap.put("Subject","Follow up inactive deal");
+		taskMap.put("Due_Date",zoho.currentdate.addDay(1));
+		taskMap.put("What_Id",dealId);
+		taskMap.put("Owner",owner.get("id"));
+
+		zoho.crm.createRecord("Tasks",taskMap);
+	}
+}
+
+// RISK LEVEL
+
+riskLevel = "Low";
+
+if(riskScore >= 20)
+{
+	riskLevel = "Medium";
+}
+
+if(riskScore >= 50)
+{
+	riskLevel = "High";
+}
+
+// APPROVAL RECORD CREATION
+
+if(approvalRequired == true)
+{
+	approvalMap = Map();
+	approvalMap.put("Deal",dealId);
+	approvalMap.put("Deal_Name",dealName);
+	approvalMap.put("Amount",amount);
+	approvalMap.put("Risk_Level",riskLevel);
+	approvalMap.put("Approval_Reason",approvalReason.toString());
+	approvalMap.put("Status","Pending");
+
+	zoho.crm.createRecord("Deal_Approvals",approvalMap);
+}
+
+// ACCOUNT HEALTH UPDATE
+
+if(accountId != "")
+{
+	accountUpdate = Map();
+
+	if(riskLevel == "High")
+	{
+		accountUpdate.put("Account_Health","At Risk");
+	}
+	else
+	{
+		accountUpdate.put("Account_Health","Healthy");
+	}
+
+	zoho.crm.updateRecord("Accounts",accountId,accountUpdate);
+}
+
+// AUDIT LOG ENTRY
+
+auditMap = Map();
+auditMap.put("Deal_Id",dealId);
+auditMap.put("Deal_Name",dealName);
+auditMap.put("Stage",stage);
+auditMap.put("Risk_Level",riskLevel);
+auditMap.put("Risk_Score",riskScore);
+auditMap.put("Approval_Required",approvalRequired);
+auditMap.put("Validation_Errors",validationErrors.toString());
+
+zoho.crm.createRecord("Deal_Audit_Logs",auditMap);
+
+// FINAL DEAL UPDATE
+
+dealUpdate = Map();
+dealUpdate.put("Risk_Level",riskLevel);
+dealUpdate.put("Risk_Score",riskScore);
+dealUpdate.put("Duplicate_Open_Deals",duplicateCount);
+
+if(validationErrors.size() > 0)
+{
+	dealUpdate.put("Governance_Status","Blocked");
+	dealUpdate.put("Governance_Remarks",validationErrors.toString());
+}
+else
+{
+	dealUpdate.put("Governance_Status","Approved");
+}
+
+zoho.crm.updateRecord("Deals",dealId,dealUpdate);
+
+// EMAIL ESCALATION
+
+if(riskLevel == "High")
+{
+	sendmail
+	[
+		from : zoho.adminuserid
+		to : "saleshead@company.com"
+		subject : "High Risk Deal Alert - " + dealName
+		message : "Deal requires immediate attention. Risk Score: " + riskScore
+	]
+}
+
+info "Deal Governance Engine Executed";
